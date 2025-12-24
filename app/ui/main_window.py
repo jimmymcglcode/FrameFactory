@@ -24,23 +24,79 @@ from app.ui.loading_overlay import LoadingOverlay
 from app.ui.theme import DARK_THEME_STYLE
 
 
+class CalibrationThread(QThread):
+    """Thread for calibration processing to avoid UI blocking."""
+    finished = pyqtSignal(float)  # Estimated time
+    error = pyqtSignal(str)
+    
+    def __init__(self, test_image: np.ndarray, pipeline: Pipeline, pixel_count: int, test_pixel_count: int):
+        super().__init__()
+        self.test_image = test_image
+        self.pipeline = pipeline
+        self.pixel_count = pixel_count
+        self.test_pixel_count = test_pixel_count
+    
+    def run(self):
+        """Calibrate processing time."""
+        try:
+            import time as time_module
+            start_time = time_module.time()
+            
+            # Apply pipeline to test region
+            test_result = self.pipeline.apply(self.test_image)
+            
+            elapsed = time_module.time() - start_time
+            
+            # Extrapolate to full image
+            enabled_effects = [e for e in self.pipeline.get_effects() if e.enabled]
+            has_small_block_shuffle = False
+            for effect in enabled_effects:
+                if effect.name == "Block Shuffle" and effect.enabled:
+                    block_size = max(1, int(effect.params.get("block_size", 32)))
+                    if block_size <= 8:
+                        has_small_block_shuffle = True
+                        break
+            
+            if has_small_block_shuffle:
+                scale_factor = (self.pixel_count / self.test_pixel_count) ** 1.5
+                estimated_time = elapsed * scale_factor * 2.0
+            else:
+                scale_factor = self.pixel_count / self.test_pixel_count
+                estimated_time = elapsed * scale_factor * 1.5
+            
+            if elapsed > 0.001:
+                estimated_time = max(estimated_time, 0.1)
+            
+            self.finished.emit(estimated_time)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class ProcessingThread(QThread):
     """Thread for processing images to avoid UI blocking."""
     finished = pyqtSignal(np.ndarray)
     error = pyqtSignal(str)
+    cancelled = False  # Flag to check for cancellation
     
     def __init__(self, image: np.ndarray, pipeline: Pipeline):
         super().__init__()
         self.image = image.copy()  # Make a copy to avoid issues
         self.pipeline = pipeline
     
+    def cancel(self):
+        """Cancel processing."""
+        self.cancelled = True
+        self.terminate()
+    
     def run(self):
         """Process image in background thread."""
         try:
             result = self.pipeline.apply(self.image)
-            self.finished.emit(result)
+            if not self.cancelled:
+                self.finished.emit(result)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.cancelled:
+                self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -52,7 +108,9 @@ class MainWindow(QMainWindow):
         self.pipeline = Pipeline()
         self.preset_manager = PresetManager(EFFECT_REGISTRY)
         self.processing_thread = None
+        self.calibration_thread = None
         self.is_processing = False
+        self.is_calibrating = False
         
         # Setup logger callback
         logger.set_log_callback(self.on_log_entry)
@@ -62,6 +120,158 @@ class MainWindow(QMainWindow):
         self.update_preview()
         
         logger.info("PixelLab started")
+    
+    def _estimate_processing_time_async(self, image: np.ndarray, pipeline: Pipeline, callback):
+        """
+        Estimate processing time asynchronously using calibration on a small test region.
+        Calls callback with estimated time in seconds when done.
+        """
+        h, w = image.shape[:2]
+        pixel_count = h * w
+        enabled_effects = [e for e in pipeline.get_effects() if e.enabled]
+        
+        if not enabled_effects:
+            callback(0.01)  # No effects, instant
+            return
+        
+        # Use calibration: process a small test region to measure actual speed
+        # Test region size: min(256x256, 25% of image size)
+        test_size = min(256, max(64, min(h, w) // 4))
+        test_h = min(test_size, h)
+        test_w = min(test_size, w)
+        
+        # Extract test region (top-left corner)
+        test_image = image[:test_h, :test_w].copy()
+        test_pixel_count = test_h * test_w
+        
+        # Show calibration loading
+        self.loading_overlay.show_loading(estimated_time=None)
+        self.loading_overlay.time_label.setText("Тестовый замер производительности...")
+        self.loading_overlay.progress_label.setText("Пожалуйста, подождите...")
+        QApplication.processEvents()
+        
+        # Start calibration in background thread
+        self.calibration_thread = CalibrationThread(test_image, pipeline, pixel_count, test_pixel_count)
+        
+        def on_calibration_finished(estimated_time):
+            self.calibration_thread = None
+            self.is_calibrating = False
+            callback(estimated_time)
+        
+        def on_calibration_error(error_msg):
+            self.calibration_thread = None
+            self.is_calibrating = False
+            # Fallback to theoretical estimate
+            estimated_time = self._theoretical_estimate(image, pipeline)
+            callback(estimated_time)
+        
+        self.calibration_thread.finished.connect(on_calibration_finished)
+        self.calibration_thread.error.connect(on_calibration_error)
+        self.is_calibrating = True
+        self.calibration_thread.start()
+    
+    def _theoretical_estimate(self, image: np.ndarray, pipeline: Pipeline) -> float:
+        """
+        Fallback theoretical estimate if calibration fails.
+        """
+        h, w = image.shape[:2]
+        pixel_count = h * w
+        total_time = 0.0
+        
+        enabled_effects = [e for e in pipeline.get_effects() if e.enabled]
+        
+        for effect in enabled_effects:
+            effect_name = effect.name
+            params = effect.params
+            
+            if effect_name == "Block Shuffle":
+                block_size = max(1, int(params.get("block_size", 32)))
+                shuffle_strength = params.get("shuffle_strength", 0.3)
+                block_transform = params.get("block_transform", "none")
+                
+                # Calculate number of blocks
+                num_blocks_y = (h + block_size - 1) // block_size
+                num_blocks_x = (w + block_size - 1) // block_size
+                total_blocks = num_blocks_y * num_blocks_x
+                
+                block_pixels = block_size * block_size
+                complexity = total_blocks * block_pixels * 2.0 * shuffle_strength
+                
+                if block_transform != "none":
+                    complexity *= 1.3
+                
+                # Very conservative estimates for small blocks
+                if block_size == 1:
+                    complexity *= 500.0  # Extremely slow
+                elif block_size <= 4:
+                    complexity *= (50.0 / block_size)
+                elif block_size <= 8:
+                    complexity *= (20.0 / block_size)
+                elif block_size <= 16:
+                    complexity *= (5.0 / block_size)
+                
+                time_per_operation = 5.0e-9
+                total_time += complexity * time_per_operation
+                
+            elif effect_name == "Warp":
+                amount = params.get("amount", 0.5)
+                mode = params.get("mode", "noise")
+                
+                # Warp uses remap which is O(pixel_count)
+                complexity = pixel_count
+                if mode == "wave":
+                    complexity *= 1.2  # Waves are slightly more complex
+                
+                time_per_operation = 2.0e-9
+                total_time += complexity * time_per_operation * (1.0 + amount)
+                
+            elif effect_name == "Shift Rows/Columns":
+                direction = params.get("direction", "rows")
+                max_shift = params.get("max_shift", 20)
+                
+                # Shift complexity: O(rows or columns * max_shift)
+                if direction == "both":
+                    complexity = (h + w) * max_shift * 2
+                else:
+                    complexity = (h if direction == "rows" else w) * max_shift
+                
+                time_per_operation = 1.0e-9
+                total_time += complexity * time_per_operation
+                
+            elif effect_name in ["Rotate/Flip", "Crop", "Scale"]:
+                # Transform operations are relatively fast
+                complexity = pixel_count * 0.5
+                time_per_operation = 1.5e-9
+                total_time += complexity * time_per_operation
+                
+            elif effect_name == "RGBCurves":
+                # RGB curves involve per-channel processing
+                complexity = pixel_count * 3  # 3 channels
+                time_per_operation = 0.5e-9
+                total_time += complexity * time_per_operation
+                
+            elif effect_name in ["HSV Adjust", "Channel Shuffle", "Posterize"]:
+                # Color operations are relatively fast
+                complexity = pixel_count
+                time_per_operation = 0.8e-9
+                total_time += complexity * time_per_operation
+                
+            elif effect_name in ["Grain", "Sharpen/Blur"]:
+                # Detail effects involve convolution
+                complexity = pixel_count * 2  # Kernel operations
+                time_per_operation = 1.2e-9
+                total_time += complexity * time_per_operation
+                
+            else:
+                # Default estimate for unknown effects
+                complexity = pixel_count
+                time_per_operation = 1.0e-9
+                total_time += complexity * time_per_operation
+        
+        # Add overhead for pipeline management (effect switching, etc.)
+        overhead = len(enabled_effects) * 0.01  # 10ms per effect
+        
+        return total_time + overhead
     
     def setup_ui(self):
         """Setup main window UI."""
@@ -123,6 +333,7 @@ class MainWindow(QMainWindow):
         # Add loading overlay to central widget
         self.loading_overlay = LoadingOverlay(central_widget)
         self.loading_overlay.hide()
+        self.loading_overlay.cancelled.connect(self.on_cancel_processing)
     
     def create_menu_bar(self):
         """Create menu bar."""
@@ -293,8 +504,6 @@ class MainWindow(QMainWindow):
         )
         
         if filepath:
-            # Show loading indicator
-            self.loading_overlay.show_loading()
             self.status_bar.showMessage("Обработка полного разрешения...")
             QApplication.processEvents()  # Update UI
             
@@ -311,6 +520,12 @@ class MainWindow(QMainWindow):
                 
                 # Process full-size image in background
                 original = self.image_model.get_original()
+                
+                # Estimate processing time for full-size image (use theoretical estimate for save to avoid delay)
+                estimated_seconds = self._theoretical_estimate(original, self.pipeline)
+                
+                # Show loading indicator with estimated time
+                self.loading_overlay.show_loading(estimated_time=estimated_seconds)
                 
                 # Use thread for processing large images
                 save_thread = ProcessingThread(original, self.pipeline)
@@ -465,23 +680,48 @@ class MainWindow(QMainWindow):
             return
         
         # Don't start new processing if one is already running
-        if self.is_processing:
+        if self.is_processing or self.is_calibrating:
             return
         
         # Stop previous thread if exists
         if self.processing_thread and self.processing_thread.isRunning():
             self.processing_thread.terminate()
             self.processing_thread.wait()
+        if self.calibration_thread and self.calibration_thread.isRunning():
+            self.calibration_thread.terminate()
+            self.calibration_thread.wait()
         
-        # Show loading indicator
-        self.loading_overlay.show_loading()
-        self.is_processing = True
+        # Estimate processing time asynchronously
+        def on_estimation_done(estimated_seconds):
+            if not self.is_processing:  # Check if not cancelled
+                # Show loading indicator with estimated time
+                self.loading_overlay.show_loading(estimated_time=estimated_seconds)
+                self.is_processing = True
+                
+                # Create and start processing thread
+                self.processing_thread = ProcessingThread(preview_image, self.pipeline)
+                self.processing_thread.finished.connect(self.on_processing_finished)
+                self.processing_thread.error.connect(self.on_processing_error)
+                self.processing_thread.start()
         
-        # Create and start processing thread
-        self.processing_thread = ProcessingThread(preview_image, self.pipeline)
-        self.processing_thread.finished.connect(self.on_processing_finished)
-        self.processing_thread.error.connect(self.on_processing_error)
-        self.processing_thread.start()
+        self._estimate_processing_time_async(preview_image, self.pipeline, on_estimation_done)
+    
+    def on_cancel_processing(self):
+        """Handle cancel button click."""
+        if self.is_processing and self.processing_thread and self.processing_thread.isRunning():
+            self.processing_thread.cancel()
+            self.processing_thread.terminate()
+            self.processing_thread.wait()
+            self.is_processing = False
+            self.loading_overlay.hide_loading()
+            logger.info("Processing cancelled by user")
+        
+        if self.is_calibrating and self.calibration_thread and self.calibration_thread.isRunning():
+            self.calibration_thread.terminate()
+            self.calibration_thread.wait()
+            self.is_calibrating = False
+            self.loading_overlay.hide_loading()
+            logger.info("Calibration cancelled by user")
     
     def on_processing_finished(self, result: np.ndarray):
         """Handle processing completion."""
